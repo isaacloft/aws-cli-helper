@@ -126,9 +126,9 @@ function aws-mfa-session() {
 
 function aws-export-keys() {
 
-  if [[ -n "$profile" ]]; then
+  if [[ -n "$1" ]]; then
     profile="$1"
-  elif [[ -z "$profile" ]]; then
+  elif [[ -z "$1" ]]; then
     if ! [ -x "$(command -v fzf)" ]; then
       echo "please install fzf to make your life easier: fzf (https://github.com/junegunn/fzf)" >&2
       return 1
@@ -147,14 +147,17 @@ function aws-export-keys() {
   sso_account_id=$(aws configure get sso_account_id --profile "$profile")
   sso_region=$(aws configure get sso_region --profile "$profile")
 
-  # find token in cache
-  token_cache_file=$(grep -l \""$sso_start_url"\" ${HOME}/.aws/sso/cache/*)
+  # find latest matching token in cache
+  token_cache_file=$(grep -l "$sso_start_url" "${HOME}/.aws/sso/cache"/*.json 2>/dev/null | tail -n 1)
   if [[ -z "$token_cache_file" ]]; then
-    # need to login
     echo "you need to aws sso login first"
     return 1
-  else
-    access_token=$(jq -r '.accessToken' < "$token_cache_file")
+  fi
+
+  access_token=$(jq -r '.accessToken // empty' < "$token_cache_file")
+  if [[ -z "$access_token" ]]; then
+    echo "No valid access token found in $token_cache_file"
+    return 1
   fi
 
   creds=$(aws sso get-role-credentials \
@@ -274,6 +277,48 @@ function _aws-profile() {
   compadd $(aws-profiles)
 }
 
+###
+# additional functions
+###
+
+function aws-create-credentials() {
+  profile=$1
+  if [[ -z "$profile" ]]; then
+    echo "profile required"
+    return 1
+  fi
+  sso_start_url=$(aws configure get sso_start_url --profile $profile)
+  sso_role_name=$(aws configure get sso_role_name --profile $profile)
+  sso_account_id=$(aws configure get sso_account_id --profile $profile)
+  sso_region=$(aws configure get sso_region --profile $profile)
+  # find token in cache
+  token_cache_file=$(grep -l \"$sso_start_url\" ~/.aws/sso/cache/*)
+  if [[ -z "$token_cache_file" ]]; then
+    # need to login
+    echo "you need to aws sso login first"
+    return 1
+  else
+    access_token=$(jq -r '.accessToken' < $token_cache_file)
+  fi
+  creds=$(aws sso get-role-credentials \
+    --profile $profile \
+    --role-name $sso_role_name \
+    --account-id $sso_account_id \
+    --region $sso_region \
+    --access-token $access_token)
+    cat <<EOT > ~/.aws/credentials_${profile}
+[${sso_account_id}_${sso_role_name}]
+aws_access_key_id = $(jq -r '.roleCredentials.accessKeyId' <<< $creds)
+aws_secret_access_key = $(jq -r '.roleCredentials.secretAccessKey' <<< $creds)
+aws_session_token = $(jq -r '.roleCredentials.sessionToken' <<< $creds)
+EOT
+}
+
+function aws-unset-credentials() {
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+}
+
+compdef _aws-profile aws-create-credentials
 compdef _aws-profile aws-ecr-get-login
 compdef _aws-profile aws-eks-configs
 compdef _aws-profile aws-export-keys
