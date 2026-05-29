@@ -125,48 +125,80 @@ function aws-mfa-session() {
 }
 
 function aws-export-keys() {
+  emulate -L zsh
 
-  if [[ -n "$profile" ]]; then
-    profile="$1"
-  elif [[ -z "$profile" ]]; then
-    if ! [ -x "$(command -v fzf)" ]; then
-      echo "please install fzf to make your life easier: fzf (https://github.com/junegunn/fzf)" >&2
-      return 1
+  local profile="$1"
+  if [[ -z "$profile" ]]; then
+    if [[ -n "$AWS_PROFILE" ]]; then
+      profile="$AWS_PROFILE"
+    else
+      if ! command -v fzf >/dev/null 2>&1; then
+        echo "Profile required. Provide one, or install fzf for interactive selection." >&2
+        return 1
+      fi
+      profile=$(aws-profiles | fzf -0 -1 --tac -q "" --prompt "> ")
     fi
-    # profile=$(aws-profiles |  fzf -0 -1 --tac -q "${1:-""}" --prompt "$current> ")
-    profile=$(aws-profiles |  fzf -0 -1 --tac -q "${1:-""}" --prompt "> ")
   fi
 
   if [[ -z "$profile" ]]; then
-    echo "Specify an AWS Profile to cut the keys"
+    echo "Specify an AWS profile." >&2
     return 1
   fi
 
+  local sso_start_url sso_role_name sso_account_id sso_region
   sso_start_url=$(aws configure get sso_start_url --profile "$profile")
   sso_role_name=$(aws configure get sso_role_name --profile "$profile")
   sso_account_id=$(aws configure get sso_account_id --profile "$profile")
   sso_region=$(aws configure get sso_region --profile "$profile")
 
-  # find token in cache
-  token_cache_file=$(grep -l \""$sso_start_url"\" ${HOME}/.aws/sso/cache/*)
-  if [[ -z "$token_cache_file" ]]; then
-    # need to login
-    echo "you need to aws sso login first"
+  if [[ -z "$sso_start_url" || -z "$sso_role_name" || -z "$sso_account_id" || -z "$sso_region" ]]; then
+    echo "Profile '$profile' is missing SSO config values." >&2
     return 1
-  else
-    access_token=$(jq -r '.accessToken' < "$token_cache_file")
   fi
 
-  creds=$(aws sso get-role-credentials \
-    --profile "$profile" \
-    --role-name "$sso_role_name" \
-    --account-id "$sso_account_id" \
-    --region "$sso_region" \
-    --access-token "$access_token")
+  local cache_dir="$HOME/.aws/sso/cache"
+  if [[ ! -d "$cache_dir" ]]; then
+    echo "SSO cache directory not found at $cache_dir. Run: aws sso login --profile $profile" >&2
+    return 1
+  fi
 
-  access_key_id=$(jq -r '.roleCredentials.accessKeyId' <<< "$creds")
-  secret_access_key=$(jq -r '.roleCredentials.secretAccessKey' <<< "$creds")
-  session_token=$(jq -r '.roleCredentials.sessionToken' <<< "$creds")
+  local access_token
+  access_token=$(
+    jq -r --arg url "$sso_start_url" '
+      select(.startUrl? == $url and .accessToken? and (.expiresAt? | length > 0))
+      | [.expiresAt, .accessToken]
+      | @tsv
+    ' "$cache_dir"/*.json 2>/dev/null \
+      | sort -r \
+      | head -n 1 \
+      | awk -F '\t' '{print $2}'
+  )
+
+  if [[ -z "$access_token" || "$access_token" == "null" ]]; then
+    echo "No valid SSO token found for '$profile'. Run: aws sso login --profile $profile" >&2
+    return 1
+  fi
+
+  local creds
+  if ! creds=$(aws sso get-role-credentials \
+      --profile "$profile" \
+      --role-name "$sso_role_name" \
+      --account-id "$sso_account_id" \
+      --region "$sso_region" \
+      --access-token "$access_token" 2>/dev/null); then
+    echo "Unable to fetch role credentials for '$profile'. Try: aws sso login --profile $profile" >&2
+    return 1
+  fi
+
+  local access_key_id secret_access_key session_token
+  access_key_id=$(jq -r '.roleCredentials.accessKeyId // empty' <<< "$creds")
+  secret_access_key=$(jq -r '.roleCredentials.secretAccessKey // empty' <<< "$creds")
+  session_token=$(jq -r '.roleCredentials.sessionToken // empty' <<< "$creds")
+
+  if [[ -z "$access_key_id" || -z "$secret_access_key" || -z "$session_token" ]]; then
+    echo "Invalid role credentials response for '$profile'. Re-run: aws sso login --profile $profile" >&2
+    return 1
+  fi
 
   export AWS_ACCESS_KEY_ID="$access_key_id"
   export AWS_SECRET_ACCESS_KEY="$secret_access_key"
